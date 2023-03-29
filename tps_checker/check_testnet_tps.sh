@@ -1,14 +1,20 @@
-
-
 #!/bin/bash
 
-if [ $(dpkg-query -W -f='${Status}' jq 2>/dev/null | grep -c "ok installed") -eq 0 ];
-then
-  sudo apt update
-  sudo apt install -y jq
+# Check if jq is installed
+if ! dpkg-query -W -f='${Status}' jq | grep -q "install ok installed"; then
+  echo "jq not found, installing..."
+  sudo apt-get update
+  sudo apt-get install -y jq
 fi
 
-echo '------------------TESTNET TPS 1.0.0-------------------'
+# Check if bc is installed
+if ! dpkg-query -W -f='${Status}' bc | grep -q "install ok installed"; then
+  echo "bc not found, installing..."
+  sudo apt-get update
+  sudo apt-get install -y bc
+fi
+
+echo '------------------TESTNET TPS-------------------'
 echo $(date)
 echo
 
@@ -18,27 +24,44 @@ LOCAL_RPC="127.0.0.1:9000"
 function get_transactions {
   result=$(curl -m 2 --location --request POST $1 \
   --header 'Content-Type: application/json' \
-  --data-raw '{ "jsonrpc":"2.0", "method":"sui_getTotalTransactionNumber","id":1}' 2>/dev/null | jq .result)
+  --data-raw '{ "jsonrpc":"2.0", "method":"sui_getTotalTransactionBlocks","id":1}' 2>/dev/null | jq .result)
 
-  echo "$result"
+    if [ -z "$result" ]; then
+      echo "Error: Failed to extract 'result' field from JSON response."
+      return 1
+    fi
+
+  echo $result
+}
+
+function calculate_tps {
+  local start=$1
+  local end=$2
+
+  if [[ "$start" =~ ^[0-9]+(\.[0-9]+)?$ && "$end" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    start=$(echo "$start" | bc)
+    end=$(echo "$end" | bc)
+    tps=$(bc <<< "scale=2; ($end - $start) / 10")
+    if [[ $? -ne 0 || -z "$tps" ]]; then
+      echo "Failed to calculate TPS: error occurred during calculation or response format has changed"
+      exit 1
+    fi
+    echo $tps
+  else
+    echo "Failed to calculate TPS: transaction data is not in the expected format or server is not running"
+    exit 1
+  fi
 }
 
 SUISTART=$(get_transactions $REMOTE_RPC)
 if [ -z "$SUISTART" ]; then
-  REMOTE_RPC="https://sui-api.rpcpool.com:443"
-
-  SUISTART=$(get_transactions $REMOTE_RPC)
-  if [ -z "$SUISTART" ]; then
-    echo "Failed to calculate TPS: check if remote testnet RPC is up and running"
-
+    echo "Failed to retrieve transactions from $REMOTE_RPC: check if remote devnet RPC is up and running or if the response format has changed"
     exit 1
-  fi
 fi
 
 NODESTART=$(get_transactions $LOCAL_RPC)
 if [ -z "$NODESTART" ]; then
-  echo "Failed to calculate TPS: check if your node is up and running on port 9000"
-
+  echo "Failed to retrieve transactions from $LOCAL_RPC: check if your node is up and running on port 9000 or if the response format has changed"
   exit 1
 fi
 
@@ -53,9 +76,19 @@ printf "\n\n"
 SUIEND=$(get_transactions $REMOTE_RPC)
 NODEEND=$(get_transactions $LOCAL_RPC)
 
-SUITPS=$(((SUIEND-SUISTART)/10))
-MYTPS=$(((NODEEND-NODESTART)/10))
+if [[ -z "$SUISTART" || -z "$SUIEND" ]]; then
+  echo "Failed to calculate SUI TPS: transaction data is missing or response format has changed"
+  exit 1
+fi
+
+if [[ -z "$NODESTART" || -z "$NODEEND" ]]; then
+  echo "Failed to calculate local TPS: transaction data is missing or response format has changed"
+  exit 1
+fi
+
+SUITPS=$(calculate_tps "${SUISTART//\"/}" "${SUIEND//\"/}")
+MYTPS=$(calculate_tps "${NODESTART//\"/}" "${NODEEND//\"/}")
 
 echo 'SUI TPS: '$SUITPS
 echo 'NODE TPS: '$MYTPS
-echo '-------------------------------------------------'
+echo '-----------------------------------------------'
